@@ -268,7 +268,7 @@ Resources:
             }
           }
         }
-      Name: TriggerGreetingWorkflowRule
+      Name: serverless-greetings-trigger-workflow-rule
       State: ENABLED
       Targets:
         - Arn: !Ref GreetingWorkflow
