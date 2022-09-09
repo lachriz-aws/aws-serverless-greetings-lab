@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Serverless Greetings Lab Stack
+Resources:
+
+  # ===============
+  # S3 bucket
+  GreetingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketName: !Sub serverless-greetings-bucket-${AWS::AccountId}-${AWS::Region}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ===============
+  # Dynamo table
+  GreetingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+      - AttributeName: Id
+        KeyType: HASH
+      TableClass: STANDARD
+      TableName: serverless-greetings
+
+  # ===============
+  # Lambda functions
+  ProcessGreetingObjectFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GetGreetingFromS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub ${GreetingsBucket.Arn}/*
+        - PolicyName: PutGreetingInDynamo
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt GreetingsTable.Arn
+
+  ProcessGreetingObjectFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: !Sub |
+          var aws = require('aws-sdk');
+          var crypto = require('crypto');
+
+          exports.handler = async function(event, context) {
+
+              // The event parameter holds the object key
+              var greetingObjectKey = event;
+              console.log('Greeting object key: ' + greetingObjectKey);
+
+              // Get greeting from S3
+              var s3 = new aws.S3();
+              var object = await s3.getObject({
+                Bucket: '${GreetingsBucket}',
+                Key: greetingObjectKey
+              }).promise();
+              var greeting = object.Body.toString();
+
+              // Put greeting into DynamoDB
+              var ddb = new aws.DynamoDB.DocumentClient();
+              var params = {
+                TableName: '${GreetingsTable}',
+                Item: {
+                  'Id': crypto.randomUUID(),
+                  'Text': greeting,
+                  'CreationTime': new Date().toISOString()
+                }
+              };
+              await ddb.put(params).promise();
+
+              // Return
+              return { greetingObjectKey: greetingObjectKey };
+          }
+      Description: Reads a greeting file from S3 and stores the greeting text in DynamoDB
+      FunctionName: serverless-greetings-process-greeting-object
+      Handler: index.handler
+      MemorySize: 256
+      PackageType: Zip
+      Role: !GetAtt ProcessGreetingObjectFunctionRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  DeleteGreetingObjectFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteGreetingFromS3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub ${GreetingsBucket.Arn}/*
+
+  DeleteGreetingObjectFunction:
+    Type: AWS::Lambda::Function
+    Properties: 
+      Architectures:
+        - arm64
+      Code:
+        ZipFile: !Sub |
+          var aws = require('aws-sdk');
+
+          exports.handler = async function(event, context) {
+
+              // The event parameter holds the object key
+              var greetingObjectKey = event;
+              console.log('Greeting object key: ' + greetingObjectKey);
+
+              // Delete greeting in S3
+              var s3 = new aws.S3();
+              await s3.deleteObject({
+                Bucket: '${GreetingsBucket}',
+                Key: greetingObjectKey
+              }).promise();
+              return { greetingObjectKey: greetingObjectKey };
+          }
+      Description: Deletes a greeting object from S3
+      FunctionName: serverless-greetings-delete-greeting-object
+      Handler: index.handler
+      MemorySize: 256
+      PackageType: Zip
+      Role: !GetAtt DeleteGreetingObjectFunctionRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+
+  # ===============
+  # State machine
+  GreetingWorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ProcessGreetingObjectFunction.Arn
+                  - !GetAtt DeleteGreetingObjectFunction.Arn
+
+  GreetingWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: serverless-greetings-workflow
+      Definition:
+        StartAt: TransformInput
+        States:
+          TransformInput:
+            Type: Pass
+            Parameters:
+              s3ObjectKey.$: $.detail.object.key
+            Next: IsTextFile
+          IsTextFile:
+            Type: Choice
+            Choices:
+              - Variable: $.s3ObjectKey
+                StringMatches: "*.txt"
+                Next: ProcessGreeting
+            Default: DeleteGreeting
+          ProcessGreeting:
+            Type: Task
+            Resource: !GetAtt ProcessGreetingObjectFunction.Arn
+            InputPath: $.s3ObjectKey
+            ResultPath: $.parentResult
+            Next: DeleteGreeting
+          DeleteGreeting:
+            Type: Task
+            Resource: !GetAtt DeleteGreetingObjectFunction.Arn
+            InputPath: $.s3ObjectKey
+            ResultPath: $.parentResult
+            End: true
+      RoleArn: !GetAtt GreetingWorkflowRole.Arn
+
+  # ===============
+  # Event Rule
+  NewObjectEventRuleIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecutionOfGreetingWorkflow
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Ref GreetingWorkflow
+
+  NewObjectEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule to trigger workflow when new greeting is uploaded
+      EventBusName: default
+      EventPattern: !Sub |
+        {
+          "source": ["aws.s3"],
+          "detail-type": ["Object Created"],
+          "detail": {
+            "bucket": {
+              "name": ["${GreetingsBucket}"]
+            }
+          }
+        }
+      Name: TriggerGreetingWorkflowRule
+      State: ENABLED
+      Targets:
+        - Arn: !Ref GreetingWorkflow
+          Id: GreetingWorkflow
+          RoleArn: !GetAtt NewObjectEventRuleIamRole.Arn
