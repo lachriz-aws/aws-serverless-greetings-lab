@@ -1,4 +1,4 @@
-## Serverless Grettings Lab
+## Serverless Greetings Lab
 
 In this (micro) lab, we're going to build an event-driven Serverless greetings processor. When created, we will have the following architecture in place:
 
